@@ -302,9 +302,6 @@ example_qss_negative_lif(simulation& sim, F f) noexcept
     return status::success;
 }
 
-/*
-    * The linear and nonlinear SEIR model was added by Ese
-    */
 	/** @brief Implements the Linear SEIR model for QSS1, QSS2 and QSS3.
      *
      * @details
@@ -320,15 +317,7 @@ example_qss_negative_lif(simulation& sim, F f) noexcept
     status
         example_qss_seir_lineaire(simulation& sim, F f) noexcept
     {
-        static_assert(1 <= QssLevel && QssLevel <= 3, "Only for Qss1, 2 and 3");
-
-        bool success = sim.can_alloc<abstract_wsum<QssLevel, 2>>(2) &&                                    
-            sim.can_alloc<abstract_multiplier<QssLevel>>(2) &&
-            sim.can_alloc<abstract_integrator<QssLevel>>(4) &&
-            sim.can_alloc<constant>(2) &&
-            sim.can_connect(12);//pour le seir_linear qu'est-ce que le nombre de connection 12,
-
-        //bool success = sim.can_alloc(10) && sim.can_connect(12);// i could have also used this format
+        bool success = sim.can_alloc(10) && sim.can_connect(12);// i could have also used this format
 
         irt_return_if_fail(success, status::simulation_not_enough_model);
 
@@ -405,16 +394,7 @@ example_qss_negative_lif(simulation& sim, F f) noexcept
     status
         example_qss_seir_nonlineaire(simulation& sim, F f) noexcept
     {
-        //static_assert(1 <= QssLevel && QssLevel <= 3, "Only for Qss1, 2 and 3");
-
-        bool success = sim.can_alloc<abstract_wsum<QssLevel, 2>>(2) &&                        
-            sim.can_alloc<abstract_wsum<QssLevel, 3>>(2) &&
-            sim.can_alloc<abstract_multiplier<QssLevel>>(9) &&
-            sim.can_alloc<abstract_integrator<QssLevel>>(4) &&
-            sim.can_alloc<constant>(10) &&
-            sim.can_connect(32);//pour le seir_non_linear qu'est-ce que le nombre de connection 32?
-
-        //bool success = sim.can_alloc(27) && sim.can_connect(32);// i could have also used this format
+        bool success = sim.can_alloc(27) && sim.can_connect(32);// i could have also used this format
 
         irt_return_if_fail(success, status::simulation_not_enough_model);
 

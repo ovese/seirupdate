@@ -7,10 +7,9 @@
 #define WINDOWS_LEAN_AND_MEAN
 #endif
 
-#include "node-editor.hpp"
-#include "gui.hpp"
-#include "imnodes.hpp"
-#include "implot.h"
+#include "application.hpp"
+#include "dialog.hpp"
+#include "internal.hpp"
 
 #include <cinttypes>
 #include <fstream>
@@ -27,6 +26,87 @@ static ImVec4
 operator*(const ImVec4& lhs, const float rhs) noexcept
 {
     return ImVec4(lhs.x * rhs, lhs.y * rhs, lhs.z * rhs, lhs.w * rhs);
+}
+
+inline int
+make_input_node_id(const irt::model_id mdl, const int port) noexcept
+{
+    irt_assert(port >= 0 && port < 8);
+
+    irt::u32 index = irt::get_index(mdl);
+    irt_assert(index < 268435456u);
+
+    irt::u32 port_index = static_cast<irt::u32>(port) << 28u;
+    index |= port_index;
+
+    return static_cast<int>(index);
+}
+
+inline int
+make_output_node_id(const irt::model_id mdl, const int port) noexcept
+{
+    irt_assert(port >= 0 && port < 8);
+
+    irt::u32 index = irt::get_index(mdl);
+    irt_assert(index < 268435456u);
+
+    irt::u32 port_index = static_cast<irt::u32>(8u + port) << 28u;
+
+    index |= port_index;
+
+    return static_cast<int>(index);
+}
+
+inline std::pair<irt::u32, irt::u32>
+get_model_input_port(const int node_id) noexcept
+{
+    const irt::u32 real_node_id = static_cast<irt::u32>(node_id);
+
+    irt::u32 port = real_node_id >> 28u;
+    irt_assert(port < 8u);
+
+    constexpr irt::u32 mask = ~(15u << 28u);
+    irt::u32 index = real_node_id & mask;
+
+    return std::make_pair(index, port);
+}
+
+inline std::pair<irt::u32, irt::u32>
+get_model_output_port(const int node_id) noexcept
+{
+    const irt::u32 real_node_id = static_cast<irt::u32>(node_id);
+
+    irt::u32 port = real_node_id >> 28u;
+
+    irt_assert(port >= 8u && port < 16u);
+    port -= 8u;
+    irt_assert(port < 8u);
+
+    constexpr irt::u32 mask = ~(15u << 28u);
+
+    irt::u32 index = real_node_id & mask;
+
+    return std::make_pair(index, port);
+}
+
+editor::editor() noexcept
+{
+    context = ImNodes::EditorContextCreate();
+    ImNodes::PushAttributeFlag(
+      ImNodesAttributeFlags_EnableLinkDetachWithDragClick);
+    ImNodesIO& io = ImNodes::GetIO();
+    io.LinkDetachWithModifierClick.Modifier = &ImGui::GetIO().KeyCtrl;
+
+    settings.compute_colors();
+}
+
+editor::~editor() noexcept
+{
+    if (context) {
+        ImNodes::EditorContextSet(context);
+        ImNodes::PopAttributeFlag();
+        ImNodes::EditorContextFree(context);
+    }
 }
 
 void
@@ -46,14 +126,6 @@ editor::settings_manager::compute_colors() noexcept
       ImGui::ColorConvertFloat4ToU32(gui_cluster_color * 1.25f);
     gui_selected_cluster_color =
       ImGui::ColorConvertFloat4ToU32(gui_cluster_color * 1.5f);
-}
-
-template<size_t N, typename... Args>
-void
-format(small_string<N>& str, const char* fmt, const Args&... args)
-{
-    auto ret = fmt::format_to_n(str.begin(), N - 1, fmt, args...);
-    str.size(ret.size);
 }
 
 void
@@ -738,7 +810,7 @@ editor::compute_grid_layout() noexcept
         remaining -= column;
     }
 
-    const auto panning = imnodes::EditorContextGetPanning();
+    const auto panning = ImNodes::EditorContextGetPanning();
     auto new_pos = panning;
 
     int elem = 0;
@@ -749,7 +821,7 @@ editor::compute_grid_layout() noexcept
         for (int j = 0; j < line; ++j) {
             new_pos.x = panning.x +
                         static_cast<float>(j) * settings.grid_layout_x_distance;
-            imnodes::SetNodeGridSpacePos(top.children[elem].second, new_pos);
+            ImNodes::SetNodeGridSpacePos(top.children[elem].second, new_pos);
             positions[elem].x = new_pos.x;
             positions[elem].y = new_pos.y;
             ++elem;
@@ -762,13 +834,13 @@ editor::compute_grid_layout() noexcept
     for (int j = 0; j < remaining; ++j) {
         new_pos.x =
           panning.x + static_cast<float>(j) * settings.grid_layout_x_distance;
-        imnodes::SetNodeGridSpacePos(top.children[elem].second, new_pos);
+        ImNodes::SetNodeGridSpacePos(top.children[elem].second, new_pos);
         positions[elem].x = new_pos.x;
         positions[elem].y = new_pos.y;
         ++elem;
     }
 
-    imnodes::EditorContextResetPanning(positions[0]);
+    ImNodes::EditorContextResetPanning(positions[0]);
 }
 
 void
@@ -872,11 +944,11 @@ editor::compute_automatic_layout() noexcept
             positions[v].x += displacements[v].x;
             positions[v].y += displacements[v].y;
 
-            imnodes::SetNodeGridSpacePos(top.children[v].second, positions[v]);
+            ImNodes::SetNodeGridSpacePos(top.children[v].second, positions[v]);
         }
     }
 
-    imnodes::EditorContextResetPanning(positions[0]);
+    ImNodes::EditorContextResetPanning(positions[0]);
 }
 
 status
@@ -945,7 +1017,8 @@ editor::initialize(u32 id) noexcept
     irt_return_if_bad(
       file_discrete_outs.init(to_unsigned(settings.kernel_model_cache)));
 
-    sim.source_dispatch = app.srcs;
+    irt_return_if_bad(srcs.init(50));
+    sim.source_dispatch = srcs;
 
     try {
         observation_outputs.resize(sim.models.capacity());
@@ -968,8 +1041,6 @@ editor::initialize(u32 id) noexcept
     synchronize_timestep = 0.;
 
     format(name, "Editor {}", id);
-
-    initialized = true;
 
     return status::success;
 }
@@ -1188,7 +1259,7 @@ show_connection(editor& ed, const model& mdl, int port, int connection_id)
                   if (auto* mdl_dst = ed.sim.models.try_to_get(c.model);
                       mdl_dst) {
                       int in = make_input_node_id(c.model, c.port_index);
-                      imnodes::Link(connection_id++, out, in);
+                      ImNodes::Link(connection_id++, out, in);
                   }
               }
           }
@@ -1211,7 +1282,7 @@ show_connection(editor& ed, const model& mdl, int connection_id)
                       if (auto* mdl_dst = ed.sim.models.try_to_get(c.model);
                           mdl_dst) {
                           int in = make_input_node_id(c.model, c.port_index);
-                          imnodes::Link(connection_id++, out, in);
+                          ImNodes::Link(connection_id++, out, in);
                       }
                   }
               }
@@ -1258,10 +1329,10 @@ editor::show_model_cluster(cluster& mdl) noexcept
         while (it != end) {
             const auto node = get_in(*it);
             if (node.model) {
-                imnodes::BeginInputAttribute(*it,
-                                             imnodes::PinShape_TriangleFilled);
+                ImNodes::BeginInputAttribute(*it,
+                                             ImNodesPinShape_TriangleFilled);
                 ImGui::TextUnformatted("");
-                imnodes::EndInputAttribute();
+                ImNodes::EndInputAttribute();
                 ++it;
             } else {
                 it = mdl.input_ports.erase(it);
@@ -1277,10 +1348,10 @@ editor::show_model_cluster(cluster& mdl) noexcept
             const auto node = get_out(*it);
 
             if (node.model) {
-                imnodes::BeginOutputAttribute(*it,
-                                              imnodes::PinShape_TriangleFilled);
+                ImNodes::BeginOutputAttribute(*it,
+                                              ImNodesPinShape_TriangleFilled);
                 ImGui::TextUnformatted("");
-                imnodes::EndOutputAttribute();
+                ImNodes::EndOutputAttribute();
                 ++it;
             } else {
                 it = mdl.output_ports.erase(it);
@@ -1303,10 +1374,10 @@ add_input_attribute(editor& ed, const Dynamics& dyn) noexcept
 
             assert(ed.sim.models.try_to_get(mdl_id) == &mdl);
 
-            imnodes::BeginInputAttribute(make_input_node_id(mdl_id, (int)i),
-                                         imnodes::PinShape_TriangleFilled);
+            ImNodes::BeginInputAttribute(make_input_node_id(mdl_id, (int)i),
+                                         ImNodesPinShape_TriangleFilled);
             ImGui::TextUnformatted(names[i]);
-            imnodes::EndInputAttribute();
+            ImNodes::EndInputAttribute();
         }
     }
 }
@@ -1326,10 +1397,10 @@ add_output_attribute(editor& ed, const Dynamics& dyn) noexcept
 
             assert(ed.sim.models.try_to_get(mdl_id) == &mdl);
 
-            imnodes::BeginOutputAttribute(make_output_node_id(mdl_id, (int)i),
-                                          imnodes::PinShape_TriangleFilled);
+            ImNodes::BeginOutputAttribute(make_output_node_id(mdl_id, (int)i),
+                                          ImNodesPinShape_TriangleFilled);
             ImGui::TextUnformatted(names[i]);
-            imnodes::EndOutputAttribute();
+            ImNodes::EndOutputAttribute();
         }
     }
 }
@@ -1715,7 +1786,7 @@ show_dynamics_values(simulation& /*sim*/, const time_func& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, none& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, none& /*dyn*/)
 {}
 
 static void
@@ -1728,51 +1799,51 @@ show_dynamics_values(simulation& /*sim*/, const flow& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_integrator& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss1_integrator& dyn)
 {
     ImGui::InputDouble("value", &dyn.default_X);
     ImGui::InputDouble("reset", &dyn.default_dQ);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_integrator& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss2_integrator& dyn)
 {
     ImGui::InputDouble("value", &dyn.default_X);
     ImGui::InputDouble("reset", &dyn.default_dQ);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_integrator& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss3_integrator& dyn)
 {
     ImGui::InputDouble("value", &dyn.default_X);
     ImGui::InputDouble("reset", &dyn.default_dQ);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_multiplier& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss1_multiplier& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_sum_2& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss1_sum_2& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_sum_3& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss1_sum_3& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_sum_4& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss1_sum_4& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_wsum_2& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss1_wsum_2& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_wsum_3& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss1_wsum_3& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1780,7 +1851,7 @@ show_dynamics_inputs(simulation& /*sim*/, qss1_wsum_3& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_wsum_4& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss1_wsum_4& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1789,70 +1860,30 @@ show_dynamics_inputs(simulation& /*sim*/, qss1_wsum_4& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_multiplier& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss2_multiplier& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_sum_2& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss2_sum_2& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_sum_3& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss2_sum_3& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_sum_4& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss2_sum_4& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_wsum_2& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss2_wsum_2& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_wsum_3& dyn)
-{
-    ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
-    ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
-    ImGui::InputDouble("coeff-2", &dyn.default_input_coeffs[2]);
-}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_wsum_4& dyn)
-{
-    ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
-    ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
-    ImGui::InputDouble("coeff-2", &dyn.default_input_coeffs[2]);
-    ImGui::InputDouble("coeff-3", &dyn.default_input_coeffs[3]);
-}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_multiplier& /*dyn*/)
-{}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_sum_2& /*dyn*/)
-{}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_sum_3& /*dyn*/)
-{}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_sum_4& /*dyn*/)
-{}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_wsum_2& dyn)
-{
-    ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
-    ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
-}
-
-static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_wsum_3& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss2_wsum_3& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1860,7 +1891,7 @@ show_dynamics_inputs(simulation& /*sim*/, qss3_wsum_3& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_wsum_4& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss2_wsum_4& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1869,28 +1900,68 @@ show_dynamics_inputs(simulation& /*sim*/, qss3_wsum_4& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, integrator& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss3_multiplier& /*dyn*/)
+{}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, qss3_sum_2& /*dyn*/)
+{}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, qss3_sum_3& /*dyn*/)
+{}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, qss3_sum_4& /*dyn*/)
+{}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, qss3_wsum_2& dyn)
+{
+    ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
+    ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
+}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, qss3_wsum_3& dyn)
+{
+    ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
+    ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
+    ImGui::InputDouble("coeff-2", &dyn.default_input_coeffs[2]);
+}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, qss3_wsum_4& dyn)
+{
+    ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
+    ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
+    ImGui::InputDouble("coeff-2", &dyn.default_input_coeffs[2]);
+    ImGui::InputDouble("coeff-3", &dyn.default_input_coeffs[3]);
+}
+
+static void
+show_dynamics_inputs(editor& /*ed*/, integrator& dyn)
 {
     ImGui::InputDouble("value", &dyn.default_current_value);
     ImGui::InputDouble("reset", &dyn.default_reset_value);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, quantifier& dyn)
+show_dynamics_inputs(editor& /*ed*/, quantifier& dyn)
 {
     ImGui::InputDouble("quantum", &dyn.default_step_size);
     ImGui::SliderInt("archive length", &dyn.default_past_length, 3, 100);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, adder_2& dyn)
+show_dynamics_inputs(editor& /*ed*/, adder_2& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, adder_3& dyn)
+show_dynamics_inputs(editor& /*ed*/, adder_3& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1898,7 +1969,7 @@ show_dynamics_inputs(simulation& /*sim*/, adder_3& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, adder_4& dyn)
+show_dynamics_inputs(editor& /*ed*/, adder_4& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1907,14 +1978,14 @@ show_dynamics_inputs(simulation& /*sim*/, adder_4& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, mult_2& dyn)
+show_dynamics_inputs(editor& /*ed*/, mult_2& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, mult_3& dyn)
+show_dynamics_inputs(editor& /*ed*/, mult_3& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1922,7 +1993,7 @@ show_dynamics_inputs(simulation& /*sim*/, mult_3& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, mult_4& dyn)
+show_dynamics_inputs(editor& /*ed*/, mult_4& dyn)
 {
     ImGui::InputDouble("coeff-0", &dyn.default_input_coeffs[0]);
     ImGui::InputDouble("coeff-1", &dyn.default_input_coeffs[1]);
@@ -1931,11 +2002,11 @@ show_dynamics_inputs(simulation& /*sim*/, mult_4& dyn)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, counter& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, counter& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, queue& dyn)
+show_dynamics_inputs(editor& /*ed*/, queue& dyn)
 {
     ImGui::InputDouble("delay", &dyn.default_ta);
     ImGui::SameLine();
@@ -1943,7 +2014,9 @@ show_dynamics_inputs(simulation& /*sim*/, queue& dyn)
 }
 
 static void
-show_external_sources_combo(const char* title, source& src)
+show_external_sources_combo(external_source& srcs,
+                            const char* title,
+                            source& src)
 {
     small_string<63> label("None");
 
@@ -1955,7 +2028,7 @@ show_external_sources_combo(const char* title, source& src)
         case external_source_type::binary_file: {
             const auto id = enum_cast<binary_file_source_id>(src.id);
             const auto index = get_index(id);
-            if (auto* es = app.srcs.binary_file_sources.try_to_get(id)) {
+            if (auto* es = srcs.binary_file_sources.try_to_get(id)) {
                 format(label,
                        "{}-{} {}",
                        ordinal(external_source_type::binary_file),
@@ -1968,7 +2041,7 @@ show_external_sources_combo(const char* title, source& src)
         case external_source_type::constant: {
             const auto id = enum_cast<constant_source_id>(src.id);
             const auto index = get_index(id);
-            if (auto* es = app.srcs.constant_sources.try_to_get(id)) {
+            if (auto* es = srcs.constant_sources.try_to_get(id)) {
                 format(label,
                        "{}-{} {}",
                        ordinal(external_source_type::constant),
@@ -1981,7 +2054,7 @@ show_external_sources_combo(const char* title, source& src)
         case external_source_type::random: {
             const auto id = enum_cast<random_source_id>(src.id);
             const auto index = get_index(id);
-            if (auto* es = app.srcs.random_sources.try_to_get(id)) {
+            if (auto* es = srcs.random_sources.try_to_get(id)) {
                 format(label,
                        "{}-{} {}",
                        ordinal(external_source_type::random),
@@ -1994,7 +2067,7 @@ show_external_sources_combo(const char* title, source& src)
         case external_source_type::text_file: {
             const auto id = enum_cast<text_file_source_id>(src.id);
             const auto index = get_index(id);
-            if (auto* es = app.srcs.text_file_sources.try_to_get(id)) {
+            if (auto* es = srcs.text_file_sources.try_to_get(id)) {
                 format(label,
                        "{}-{} {}",
                        ordinal(external_source_type::text_file),
@@ -2019,8 +2092,8 @@ show_external_sources_combo(const char* title, source& src)
 
         {
             constant_source* s = nullptr;
-            while (app.srcs.constant_sources.next(s)) {
-                const auto id = app.srcs.constant_sources.get_id(s);
+            while (srcs.constant_sources.next(s)) {
+                const auto id = srcs.constant_sources.get_id(s);
                 const auto index = get_index(id);
 
                 format(label,
@@ -2043,8 +2116,8 @@ show_external_sources_combo(const char* title, source& src)
 
         {
             binary_file_source* s = nullptr;
-            while (app.srcs.binary_file_sources.next(s)) {
-                const auto id = app.srcs.binary_file_sources.get_id(s);
+            while (srcs.binary_file_sources.next(s)) {
+                const auto id = srcs.binary_file_sources.get_id(s);
                 const auto index = get_index(id);
 
                 format(label,
@@ -2067,8 +2140,8 @@ show_external_sources_combo(const char* title, source& src)
 
         {
             random_source* s = nullptr;
-            while (app.srcs.random_sources.next(s)) {
-                const auto id = app.srcs.random_sources.get_id(s);
+            while (srcs.random_sources.next(s)) {
+                const auto id = srcs.random_sources.get_id(s);
                 const auto index = get_index(id);
 
                 format(label,
@@ -2091,8 +2164,8 @@ show_external_sources_combo(const char* title, source& src)
 
         {
             text_file_source* s = nullptr;
-            while (app.srcs.text_file_sources.next(s)) {
-                const auto id = app.srcs.text_file_sources.get_id(s);
+            while (srcs.text_file_sources.next(s)) {
+                const auto id = srcs.text_file_sources.get_id(s);
                 const auto index = get_index(id);
 
                 format(label,
@@ -2118,7 +2191,7 @@ show_external_sources_combo(const char* title, source& src)
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, dynamic_queue& dyn)
+show_dynamics_inputs(editor& ed, dynamic_queue& dyn)
 {
     ImGui::Checkbox("Stop on error", &dyn.stop_on_error);
     ImGui::SameLine();
@@ -2126,11 +2199,11 @@ show_dynamics_inputs(simulation& /*sim*/, dynamic_queue& dyn)
       "Unchecked, the dynamic queue stops to send data if the source are "
       "empty or undefined. Checked, the simulation will stop.");
 
-    show_external_sources_combo("time", dyn.default_source_ta);
+    show_external_sources_combo(ed.srcs, "time", dyn.default_source_ta);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, priority_queue& dyn)
+show_dynamics_inputs(editor& ed, priority_queue& dyn)
 {
     ImGui::Checkbox("Stop on error", &dyn.stop_on_error);
     ImGui::SameLine();
@@ -2138,11 +2211,11 @@ show_dynamics_inputs(simulation& /*sim*/, priority_queue& dyn)
       "Unchecked, the priority queue stops to send data if the source are "
       "empty or undefined. Checked, the simulation will stop.");
 
-    show_external_sources_combo("time", dyn.default_source_ta);
+    show_external_sources_combo(ed.srcs, "time", dyn.default_source_ta);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, generator& dyn)
+show_dynamics_inputs(editor& ed, generator& dyn)
 {
     ImGui::InputDouble("offset", &dyn.default_offset);
     ImGui::Checkbox("Stop on error", &dyn.stop_on_error);
@@ -2150,90 +2223,112 @@ show_dynamics_inputs(simulation& /*sim*/, generator& dyn)
     HelpMarker("Unchecked, the generator stops to send data if the source are "
                "empty or undefined. Checked, the simulation will stop.");
 
-    show_external_sources_combo("source", dyn.default_source_value);
-    show_external_sources_combo("time", dyn.default_source_ta);
+    show_external_sources_combo(ed.srcs, "source", dyn.default_source_value);
+    show_external_sources_combo(ed.srcs, "time", dyn.default_source_ta);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, constant& dyn)
+show_dynamics_inputs(editor& ed, constant& dyn)
 {
     ImGui::InputDouble("value", &dyn.default_value);
+    ImGui::InputDouble("offset", &dyn.default_offset);
+
+    if (ed.is_running()) {
+        if (ImGui::Button("Send now")) {
+            dyn.value = dyn.default_value;
+            dyn.sigma = dyn.default_offset;
+
+            auto& mdl = get_model(dyn);
+            mdl.tl = ed.simulation_current;
+            mdl.tn = ed.simulation_current + dyn.sigma;
+            if (dyn.sigma && mdl.tn == ed.simulation_current)
+                mdl.tn = std::nextafter(ed.simulation_current,
+                                        ed.simulation_current + 1.);
+
+            ed.sim.sched.update(mdl, mdl.tn);
+        }
+    }
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_cross& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss1_cross& dyn)
 {
     ImGui::InputDouble("threshold", &dyn.default_threshold);
     ImGui::Checkbox("up detection", &dyn.default_detect_up);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_cross& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss2_cross& dyn)
 {
     ImGui::InputDouble("threshold", &dyn.default_threshold);
     ImGui::Checkbox("up detection", &dyn.default_detect_up);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_cross& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss3_cross& dyn)
 {
     ImGui::InputDouble("threshold", &dyn.default_threshold);
     ImGui::Checkbox("up detection", &dyn.default_detect_up);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_power& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss1_power& dyn)
 {
     ImGui::InputDouble("n", &dyn.default_n);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_power& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss2_power& dyn)
 {
     ImGui::InputDouble("n", &dyn.default_n);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_power& dyn)
+show_dynamics_inputs(editor& /*ed*/, qss3_power& dyn)
 {
     ImGui::InputDouble("n", &dyn.default_n);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss1_square& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss1_square& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss2_square& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss2_square& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, qss3_square& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, qss3_square& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, cross& dyn)
+show_dynamics_inputs(editor& /*ed*/, cross& dyn)
 {
     ImGui::InputDouble("threshold", &dyn.default_threshold);
 }
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, accumulator_2& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, accumulator_2& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, flow& /*dyn*/)
+show_dynamics_inputs(editor& /*ed*/, flow& /*dyn*/)
 {}
 
 static void
-show_dynamics_inputs(simulation& /*sim*/, time_func& dyn)
+show_dynamics_inputs(editor& /*ed*/, time_func& dyn)
 {
-    const char* items[] = { "time", "square" };
+    static const char* items[] = { "time", "square", "sin" };
+
     ImGui::PushItemWidth(120.0f);
-    int item_current = dyn.default_f == &time_function ? 0 : 1;
+    int item_current = dyn.default_f == &time_function          ? 0
+                       : dyn.default_f == &square_time_function ? 1
+                                                                : 2;
+
     if (ImGui::Combo("function", &item_current, items, IM_ARRAYSIZE(items))) {
-        dyn.default_f =
-          item_current == 0 ? &time_function : square_time_function;
+        dyn.default_f = item_current == 0   ? &time_function
+                        : item_current == 1 ? &square_time_function
+                                            : sin_time_function;
     }
     ImGui::PopItemWidth();
 }
@@ -2255,7 +2350,7 @@ editor::show_model_dynamics(model& mdl) noexcept
             ImGui::PushItemWidth(120.0f);
 
             if (settings.show_dynamics_inputs_in_editor)
-                show_dynamics_inputs(sim, dyn);
+                show_dynamics_inputs(*this, dyn);
             ImGui::PopItemWidth();
             add_output_attribute(*this, dyn);
         });
@@ -2346,31 +2441,30 @@ editor::show_top() noexcept
                 if (st != editor_status::editing &&
                     models_make_transition[get_index(id)]) {
 
-                    imnodes::PushColorStyle(
-                      imnodes::ColorStyle_TitleBar,
+                    ImNodes::PushColorStyle(
+                      ImNodesCol_TitleBar,
                       ImGui::ColorConvertFloat4ToU32(
                         settings.gui_model_transition_color));
 
-                    imnodes::PushColorStyle(
-                      imnodes::ColorStyle_TitleBarHovered,
+                    ImNodes::PushColorStyle(
+                      ImNodesCol_TitleBarHovered,
                       settings.gui_hovered_model_transition_color);
-                    imnodes::PushColorStyle(
-                      imnodes::ColorStyle_TitleBarSelected,
+                    ImNodes::PushColorStyle(
+                      ImNodesCol_TitleBarSelected,
                       settings.gui_selected_model_transition_color);
                 } else {
-                    imnodes::PushColorStyle(
-                      imnodes::ColorStyle_TitleBar,
+                    ImNodes::PushColorStyle(
+                      ImNodesCol_TitleBar,
                       ImGui::ColorConvertFloat4ToU32(settings.gui_model_color));
 
-                    imnodes::PushColorStyle(imnodes::ColorStyle_TitleBarHovered,
+                    ImNodes::PushColorStyle(ImNodesCol_TitleBarHovered,
                                             settings.gui_hovered_model_color);
-                    imnodes::PushColorStyle(
-                      imnodes::ColorStyle_TitleBarSelected,
-                      settings.gui_selected_model_color);
+                    ImNodes::PushColorStyle(ImNodesCol_TitleBarSelected,
+                                            settings.gui_selected_model_color);
                 }
 
-                imnodes::BeginNode(top.children[i].second);
-                imnodes::BeginNodeTitleBar();
+                ImNodes::BeginNode(top.children[i].second);
+                ImNodes::BeginNodeTitleBar();
                 // ImGui::TextUnformatted(mdl->name.c_str());
                 // ImGui::OpenPopupOnItemClick("Rename model", 1);
 
@@ -2386,29 +2480,30 @@ editor::show_top() noexcept
                 //    ImGui::EndPopup();
                 //}
 
-                ImGui::Text("%s",
+                ImGui::Text("%zu\n%s",
+                            i,
                             dynamics_type_names[static_cast<int>(mdl->type)]);
 
-                imnodes::EndNodeTitleBar();
+                ImNodes::EndNodeTitleBar();
                 show_model_dynamics(*mdl);
-                imnodes::EndNode();
+                ImNodes::EndNode();
 
-                imnodes::PopColorStyle();
-                imnodes::PopColorStyle();
+                ImNodes::PopColorStyle();
+                ImNodes::PopColorStyle();
             }
         } else {
             const auto id = std::get<cluster_id>(top.children[i].first);
             if (auto* gp = clusters.try_to_get(id); gp) {
-                imnodes::PushColorStyle(
-                  imnodes::ColorStyle_TitleBar,
+                ImNodes::PushColorStyle(
+                  ImNodesCol_TitleBar,
                   ImGui::ColorConvertFloat4ToU32(settings.gui_cluster_color));
-                imnodes::PushColorStyle(imnodes::ColorStyle_TitleBarHovered,
+                ImNodes::PushColorStyle(ImNodesCol_TitleBarHovered,
                                         settings.gui_hovered_cluster_color);
-                imnodes::PushColorStyle(imnodes::ColorStyle_TitleBarSelected,
+                ImNodes::PushColorStyle(ImNodesCol_TitleBarSelected,
                                         settings.gui_selected_cluster_color);
 
-                imnodes::BeginNode(top.children[i].second);
-                imnodes::BeginNodeTitleBar();
+                ImNodes::BeginNode(top.children[i].second);
+                ImNodes::BeginNodeTitleBar();
                 ImGui::TextUnformatted(gp->name.c_str());
                 ImGui::OpenPopupOnItemClick("Rename group", 1);
 
@@ -2422,12 +2517,12 @@ editor::show_top() noexcept
                     ImGui::EndPopup();
                 }
 
-                imnodes::EndNodeTitleBar();
+                ImNodes::EndNodeTitleBar();
                 show_model_cluster(*gp);
-                imnodes::EndNode();
+                ImNodes::EndNode();
 
-                imnodes::PopColorStyle();
-                imnodes::PopColorStyle();
+                ImNodes::PopColorStyle();
+                ImNodes::PopColorStyle();
             }
         }
     }
@@ -2489,276 +2584,9 @@ add_popup_menuitem(editor& ed, dynamics_type type, model_id* new_model)
     return status::success;
 }
 
-bool
+void
 editor::show_editor() noexcept
 {
-    imnodes::EditorContextSet(context);
-
-    ImGuiWindowFlags windows_flags = 0;
-    windows_flags |= ImGuiWindowFlags_MenuBar;
-
-    ImGui::SetNextWindowPos(ImVec2(500, 50), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(800, 700), ImGuiCond_Once);
-    if (!ImGui::Begin(name.c_str(), &show, windows_flags)) {
-        ImGui::End();
-        return true;
-    }
-
-    if (ImGui::BeginMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open"))
-                show_load_file_dialog = true;
-
-            if (!path.empty() && ImGui::MenuItem("Save")) {
-                log_w.log(3,
-                          "Write into file %s\n",
-                          (const char*)path.u8string().c_str());
-                if (auto os = std::ofstream(path); os.is_open()) {
-                    writer w(os);
-                    auto ret = w(sim, app.srcs);
-                    if (is_success(ret))
-                        log_w.log(5, "success\n");
-                    else
-                        log_w.log(4, "error writing\n");
-                }
-            }
-
-            if (ImGui::MenuItem("Save as..."))
-                show_save_file_dialog = true;
-
-            if (ImGui::MenuItem("Close")) {
-                ImGui::EndMenu();
-                ImGui::EndMenuBar();
-                ImGui::End();
-                return false;
-            }
-
-            ImGui::EndMenu();
-        }
-
-        if (ImGui::BeginMenu("Edition")) {
-            ImGui::MenuItem("Show parameter in models",
-                            nullptr,
-                            &settings.show_dynamics_inputs_in_editor);
-            if (ImGui::MenuItem("Clear"))
-                clear();
-            if (ImGui::MenuItem("Grid Reorder"))
-                compute_grid_layout();
-            if (ImGui::MenuItem("Automatic Layout"))
-                compute_automatic_layout();
-            if (ImGui::MenuItem("Settings"))
-                show_settings = true;
-
-            ImGui::EndMenu();
-        }
-
-        auto empty_fun = [this](irt::model_id id) {
-            this->top.emplace_back(id);
-            parent(id, undefined<cluster_id>());
-        };
-
-        if (ImGui::BeginMenu("Examples")) {
-            if (ImGui::MenuItem("Insert example AQSS lotka_volterra"))
-                if (auto ret = add_lotka_volterra(); is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize a Lotka Volterra "
-                              "model (%s)\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert Izhikevitch model"))
-                if (auto ret = add_izhikevitch(); is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize an Izhikevitch "
-                              "model (%s)\n",
-                              status_string(ret));
-
-            if (ImGui::MenuItem("Insert example QSS1 lotka_volterra"))
-                if (auto ret = example_qss_lotka_volterra<1>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize "
-                              "example_qss_lotka_volterra<1>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS1 negative_lif"))
-                if (auto ret = example_qss_negative_lif<1>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize "
-                              "example_qss_negative_lif<1>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS1 lif"))
-                if (auto ret = example_qss_lif<1>(sim, empty_fun); is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize example_qss_lif<1>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS1 van_der_pol"))
-                if (auto ret = example_qss_van_der_pol<1>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(
-                      3,
-                      "Fail to initialize example_qss_van_der_pol<1>: %s\n",
-                      status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS1 izhikevich"))
-                if (auto ret = example_qss_izhikevich<1>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(
-                      3,
-                      "Fail to initialize example_qss_izhikevich<1>: %s\n",
-                      status_string(ret));
-
-            /*
-             * Adding my model links here +++++++++++++++++
-             */ 
-            if (ImGui::MenuItem("Insert example QSS1 seir_lineaire")) // I have added the SEIR model links here ( les liens du modeles SEIR sont ajoutee ici)
-                    if (auto ret = example_qss_seir_lineaire<1>(sim, empty_fun);
-                        is_bad(ret))
-                        log_w.log(
-                            3,
-                            "Fail to initialize example_qss_seir_lineaire<1>: %s\n",
-                            status_string(ret));
-                if (ImGui::MenuItem("Insert example QSS1 seir_nonlineaire"))
-                    if (auto ret = example_qss_seir_nonlineaire<1>(sim, empty_fun);
-                        is_bad(ret))
-                        log_w.log(
-                            3,
-                            "Fail to initialize example_qss_seir_nonlineaire<1>: %s\n",
-                            status_string(ret)); 
-            //My addition ends here-----------        
-
-            if (ImGui::MenuItem("Insert example QSS2 lotka_volterra"))
-                if (auto ret = example_qss_lotka_volterra<2>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize "
-                              "example_qss_lotka_volterra<2>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS2 negative_lif"))
-                if (auto ret = example_qss_negative_lif<2>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize "
-                              "example_qss_negative_lif<2>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS2 lif"))
-                if (auto ret = example_qss_lif<2>(sim, empty_fun); is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize example_qss_lif<2>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS2 van_der_pol"))
-                if (auto ret = example_qss_van_der_pol<2>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(
-                      3,
-                      "Fail to initialize example_qss_van_der_pol<2>: %s\n",
-                      status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS2 izhikevich"))
-                if (auto ret = example_qss_izhikevich<2>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(
-                      3,
-                      "Fail to initialize example_qss_izhikevich<2>: %s\n",
-                      status_string(ret));
-
-            if (ImGui::MenuItem("Insert example QSS3 lotka_volterra"))
-                if (auto ret = example_qss_lotka_volterra<3>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize "
-                              "example_qss_lotka_volterra<3>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS3 negative_lif"))
-                if (auto ret = example_qss_negative_lif<3>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize "
-                              "example_qss_negative_lif<3>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS3 lif"))
-                if (auto ret = example_qss_lif<3>(sim, empty_fun); is_bad(ret))
-                    log_w.log(3,
-                              "Fail to initialize example_qss_lif<3>: %s\n",
-                              status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS3 van_der_pol"))
-                if (auto ret = example_qss_van_der_pol<3>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(
-                      3,
-                      "Fail to initialize example_qss_van_der_pol<3>: %s\n",
-                      status_string(ret));
-            if (ImGui::MenuItem("Insert example QSS3 izhikevich"))
-                if (auto ret = example_qss_izhikevich<3>(sim, empty_fun);
-                    is_bad(ret))
-                    log_w.log(
-                      3,
-                      "Fail to initialize example_qss_izhikevich<3>: %s\n",
-                      status_string(ret));
-
-            ImGui::EndMenu();
-        }
-
-        ImGui::EndMenuBar();
-    }
-
-    if (show_select_directory_dialog) {
-        ImGui::OpenPopup("Select directory");
-        if (select_directory_dialog(observation_directory)) {
-            show_select_directory_dialog = false;
-
-            log_w.log(
-              5, "Output directory: %s", (const char*)path.u8string().c_str());
-        }
-    }
-
-    if (show_load_file_dialog) {
-        const char* title = "Select file path to load";
-        const char8_t* filters[] = { u8".irt", nullptr };
-
-        ImGui::OpenPopup(title);
-        if (load_file_dialog(path, title, filters)) {
-            show_load_file_dialog = false;
-            log_w.log(
-              5, "Load file from %s: ", (const char*)path.u8string().c_str());
-            if (auto is = std::ifstream(path); is.is_open()) {
-                reader r(is);
-                auto ret = r(sim, app.srcs, [this](model_id id) {
-                    parent(id, undefined<cluster_id>());
-
-                    imnodes::SetNodeEditorSpacePos(
-                      top.emplace_back(id), imnodes::EditorContextGetPanning());
-                });
-
-                if (is_success(ret))
-                    log_w.log(5, "success\n");
-                else
-                    log_w.log(4, "fail\n");
-            }
-        }
-    }
-
-    if (show_save_file_dialog) {
-        if (sim.models.size()) {
-            const char* title = "Select file path to save";
-            const char8_t* filters[] = { u8".irt", nullptr };
-
-            ImGui::OpenPopup(title);
-            if (save_file_dialog(path, title, filters)) {
-                show_save_file_dialog = false;
-                log_w.log(
-                  5, "Save file to %s\n", (const char*)path.u8string().c_str());
-
-                log_w.log(3,
-                          "Write into file %s\n",
-                          (const char*)path.u8string().c_str());
-                if (auto os = std::ofstream(path); os.is_open()) {
-                    writer w(os);
-                    auto ret = w(sim, app.srcs);
-                    if (is_success(ret))
-                        log_w.log(5, "success\n");
-                    else
-                        log_w.log(4, "error writing\n");
-                }
-            }
-        }
-    }
 
     ImGui::Text("X -- delete selected nodes and/or connections / "
                 "D -- duplicate selected nodes / "
@@ -2771,36 +2599,28 @@ editor::show_editor() noexcept
       ImGuiTableFlags_BordersV;
 
     if (ImGui::BeginTable("Editor", 2, flags)) {
+        ImNodes::EditorContextSet(context);
+
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
 
-        imnodes::BeginNodeEditor();
+        ImNodes::BeginNodeEditor();
 
         show_top();
         show_connections();
 
-        imnodes::EndNodeEditor();
+        const bool open_popup =
+          ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+          ImNodes::IsEditorHovered() && ImGui::IsMouseClicked(1);
+
+        model_id new_model = undefined<model_id>();
+        const auto click_pos = ImGui::GetMousePosOnOpeningCurrentPopup();
 
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
-
-        int node_id;
-        if (imnodes::IsNodeHovered(&node_id) &&
-            st == editor_status::running_debug) {
-            const auto index = top.get_index(node_id);
-            if (index != not_found || top.children[index].first.index() == 0) {
-                const auto id = std::get<model_id>(top.children[index].first);
-                if (auto* mdl = sim.models.try_to_get(id); mdl)
-                    show_tooltip(*this, *mdl, id);
-            }
-        } else
-            tooltip.clear();
-
-        if (!ImGui::IsAnyItemHovered() && ImGui::IsMouseClicked(1))
+        if (!ImGui::IsAnyItemHovered() && open_popup)
             ImGui::OpenPopup("Context menu");
 
         if (ImGui::BeginPopup("Context menu")) {
-            model_id new_model = undefined<model_id>();
-            ImVec2 click_pos = ImGui::GetMousePosOnOpeningCurrentPopup();
 
             if (ImGui::BeginMenu("QSS1")) {
                 auto i = static_cast<int>(dynamics_type::qss1_integrator);
@@ -2858,17 +2678,37 @@ editor::show_editor() noexcept
             add_popup_menuitem(*this, dynamics_type::flow, &new_model);
 
             ImGui::EndPopup();
-
-            if (new_model != undefined<model_id>()) {
-                parent(new_model, undefined<cluster_id>());
-                imnodes::SetNodeScreenSpacePos(top.emplace_back(new_model),
-                                               click_pos);
-            }
         }
+
+        ImGui::PopStyleVar();
+
+        if (show_minimap)
+            ImNodes::MiniMap(0.2f, ImNodesMiniMapLocation_BottomLeft);
+
+        ImNodes::EndNodeEditor();
+
+        if (new_model != undefined<model_id>()) {
+            parent(new_model, undefined<cluster_id>());
+            ImNodes::SetNodeScreenSpacePos(top.emplace_back(new_model),
+                                           click_pos);
+        }
+
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
+
+        int node_id;
+        if (ImNodes::IsNodeHovered(&node_id) && is_running()) {
+            const auto index = top.get_index(node_id);
+            if (index != not_found || top.children[index].first.index() == 0) {
+                const auto id = std::get<model_id>(top.children[index].first);
+                if (auto* mdl = sim.models.try_to_get(id); mdl)
+                    show_tooltip(*this, *mdl, id);
+            }
+        } else
+            tooltip.clear();
 
         {
             int start = 0, end = 0;
-            if (imnodes::IsLinkCreated(&start, &end)) {
+            if (ImNodes::IsLinkCreated(&start, &end)) {
                 const gport out = get_out(start);
                 const gport in = get_in(end);
 
@@ -2885,8 +2725,8 @@ editor::show_editor() noexcept
 
         ImGui::PopStyleVar();
 
-        const int num_selected_links = imnodes::NumSelectedLinks();
-        const int num_selected_nodes = imnodes::NumSelectedNodes();
+        const int num_selected_links = ImNodes::NumSelectedLinks();
+        const int num_selected_nodes = ImNodes::NumSelectedNodes();
         static ImVector<int> selected_nodes;
         static ImVector<int> selected_links;
 
@@ -2894,21 +2734,21 @@ editor::show_editor() noexcept
             selected_nodes.resize(num_selected_nodes, -1);
 
             if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyReleased('X')) {
-                imnodes::GetSelectedNodes(selected_nodes.begin());
+                ImNodes::GetSelectedNodes(selected_nodes.begin());
                 log_w.log(7, "%d model(s) to delete\n", num_selected_nodes);
                 free_children(selected_nodes);
             } else if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyReleased('D')) {
-                imnodes::GetSelectedNodes(selected_nodes.begin());
+                ImNodes::GetSelectedNodes(selected_nodes.begin());
                 log_w.log(
                   7, "%d model(s)/group(s) to copy\n", num_selected_nodes);
                 copy(selected_nodes);
             } else if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyReleased('G')) {
                 if (num_selected_nodes > 1) {
-                    imnodes::GetSelectedNodes(selected_nodes.begin());
+                    ImNodes::GetSelectedNodes(selected_nodes.begin());
                     log_w.log(7, "%d model(s) to group\n", num_selected_nodes);
                     group(selected_nodes);
                 } else if (num_selected_nodes == 1) {
-                    imnodes::GetSelectedNodes(selected_nodes.begin());
+                    ImNodes::GetSelectedNodes(selected_nodes.begin());
                     log_w.log(7, "group to ungroup\n");
                     ungroup(selected_nodes[0]);
                 }
@@ -2919,7 +2759,7 @@ editor::show_editor() noexcept
 
             if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyReleased('X')) {
                 std::fill_n(selected_links.begin(), selected_links.size(), -1);
-                imnodes::GetSelectedLinks(selected_links.begin());
+                ImNodes::GetSelectedLinks(selected_links.begin());
                 std::sort(selected_links.begin(),
                           selected_links.end(),
                           std::less<int>());
@@ -2986,7 +2826,7 @@ editor::show_editor() noexcept
                                       ImGuiTreeNodeFlags_DefaultOpen) &&
             num_selected_nodes) {
             selected_nodes.resize(num_selected_nodes, -1);
-            imnodes::GetSelectedNodes(selected_nodes.begin());
+            ImNodes::GetSelectedNodes(selected_nodes.begin());
 
             static std::vector<std::string> names;
             names.clear();
@@ -3108,7 +2948,7 @@ editor::show_editor() noexcept
                     sim.dispatch(*mdl,
                                  [this]<typename Dynamics>(Dynamics& dyn) {
                                      ImGui::Spacing();
-                                     show_dynamics_inputs(this->sim, dyn);
+                                     show_dynamics_inputs(*this, dyn);
                                  });
 
                     ImGui::TreePop();
@@ -3118,122 +2958,305 @@ editor::show_editor() noexcept
 
         ImGui::EndTable();
     }
+}
+
+bool
+editor::show_window() noexcept
+{
+    ImGuiWindowFlags windows_flags = 0;
+    windows_flags |= ImGuiWindowFlags_MenuBar;
+
+    ImGui::SetNextWindowPos(ImVec2(500, 50), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(800, 700), ImGuiCond_Once);
+    if (!ImGui::Begin(name.c_str(), &show, windows_flags)) {
+        ImGui::End();
+        return true;
+    }
+
+    if (ImGui::BeginMenuBar()) {
+        if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Open"))
+                show_load_file_dialog = true;
+
+            if (!path.empty() && ImGui::MenuItem("Save")) {
+                log_w.log(3,
+                          "Write into file %s\n",
+                          (const char*)path.u8string().c_str());
+                if (auto os = std::ofstream(path); os.is_open()) {
+                    writer w(os);
+                    auto ret = w(sim, srcs);
+                    if (is_success(ret))
+                        log_w.log(5, "success\n");
+                    else
+                        log_w.log(4, "error writing\n");
+                }
+            }
+
+            if (ImGui::MenuItem("Save as..."))
+                show_save_file_dialog = true;
+
+            if (ImGui::MenuItem("Close")) {
+                ImGui::EndMenu();
+                ImGui::EndMenuBar();
+                ImGui::End();
+                return false;
+            }
+
+            ImGui::EndMenu();
+        }
+
+        if (ImGui::BeginMenu("Edition")) {
+            ImGui::MenuItem("Show minimap", nullptr, &show_minimap);
+            ImGui::MenuItem("Show parameter in models",
+                            nullptr,
+                            &settings.show_dynamics_inputs_in_editor);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Clear"))
+                clear();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Grid Reorder"))
+                compute_grid_layout();
+            if (ImGui::MenuItem("Automatic Layout"))
+                compute_automatic_layout();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Settings"))
+                show_settings = true;
+
+            ImGui::EndMenu();
+        }
+
+        auto empty_fun = [this](irt::model_id id) {
+            this->top.emplace_back(id);
+            parent(id, undefined<cluster_id>());
+        };
+
+        if (ImGui::BeginMenu("Examples")) {
+            if (ImGui::MenuItem("Insert example AQSS lotka_volterra"))
+                if (auto ret = add_lotka_volterra(); is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize a Lotka Volterra "
+                              "model (%s)\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert Izhikevitch model"))
+                if (auto ret = add_izhikevitch(); is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize an Izhikevitch "
+                              "model (%s)\n",
+                              status_string(ret));
+
+            if (ImGui::MenuItem("Insert example QSS1 lotka_volterra"))
+                if (auto ret = example_qss_lotka_volterra<1>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize "
+                              "example_qss_lotka_volterra<1>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS1 negative_lif"))
+                if (auto ret = example_qss_negative_lif<1>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize "
+                              "example_qss_negative_lif<1>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS1 lif"))
+                if (auto ret = example_qss_lif<1>(sim, empty_fun); is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize example_qss_lif<1>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS1 van_der_pol"))
+                if (auto ret = example_qss_van_der_pol<1>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_van_der_pol<1>: %s\n",
+                      status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS1 izhikevich"))
+                if (auto ret = example_qss_izhikevich<1>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_izhikevich<1>: %s\n",
+                      status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS1 seir_lineaire"))
+                if (auto ret = example_qss_seir_lineaire<1>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_seir_lineaire<1>:%s\n",
+                      status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS1 seir_nonlineaire"))
+                if (auto ret = example_qss_seir_nonlineaire<1>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_seir_nonlineaire<1>:%s\n",
+                      status_string(ret));
+
+            if (ImGui::MenuItem("Insert example QSS2 lotka_volterra"))
+                if (auto ret = example_qss_lotka_volterra<2>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize "
+                              "example_qss_lotka_volterra<2>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS2 negative_lif"))
+                if (auto ret = example_qss_negative_lif<2>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize "
+                              "example_qss_negative_lif<2>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS2 lif"))
+                if (auto ret = example_qss_lif<2>(sim, empty_fun); is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize example_qss_lif<2>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS2 van_der_pol"))
+                if (auto ret = example_qss_van_der_pol<2>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_van_der_pol<2>: %s\n",
+                      status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS2 izhikevich"))
+                if (auto ret = example_qss_izhikevich<2>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_izhikevich<2>: %s\n",
+                      status_string(ret));
+
+            if (ImGui::MenuItem("Insert example QSS3 lotka_volterra"))
+                if (auto ret = example_qss_lotka_volterra<3>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize "
+                              "example_qss_lotka_volterra<3>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS3 negative_lif"))
+                if (auto ret = example_qss_negative_lif<3>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize "
+                              "example_qss_negative_lif<3>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS3 lif"))
+                if (auto ret = example_qss_lif<3>(sim, empty_fun); is_bad(ret))
+                    log_w.log(3,
+                              "Fail to initialize example_qss_lif<3>: %s\n",
+                              status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS3 van_der_pol"))
+                if (auto ret = example_qss_van_der_pol<3>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_van_der_pol<3>: %s\n",
+                      status_string(ret));
+            if (ImGui::MenuItem("Insert example QSS3 izhikevich"))
+                if (auto ret = example_qss_izhikevich<3>(sim, empty_fun);
+                    is_bad(ret))
+                    log_w.log(
+                      3,
+                      "Fail to initialize example_qss_izhikevich<3>: %s\n",
+                      status_string(ret));
+
+            ImGui::EndMenu();
+        }
+
+        ImGui::EndMenuBar();
+    }
+
+    if (show_select_directory_dialog) {
+        ImGui::OpenPopup("Select directory");
+        if (select_directory_dialog(observation_directory)) {
+            show_select_directory_dialog = false;
+
+            log_w.log(
+              5, "Output directory: %s", (const char*)path.u8string().c_str());
+        }
+    }
+
+    if (show_load_file_dialog) {
+        const char* title = "Select file path to load";
+        const char8_t* filters[] = { u8".irt", nullptr };
+
+        ImGui::OpenPopup(title);
+        if (load_file_dialog(path, title, filters)) {
+            show_load_file_dialog = false;
+            log_w.log(
+              5, "Load file from %s: ", (const char*)path.u8string().c_str());
+            if (auto is = std::ifstream(path); is.is_open()) {
+                reader r(is);
+                auto ret = r(sim, srcs, [&r, this](model_id id) {
+                    parent(id, undefined<cluster_id>());
+
+                    const auto index = get_index(id);
+                    const auto new_id = top.emplace_back(id);
+                    const auto pos = r.get_position(index);
+
+                    ImNodes::SetNodeEditorSpacePos(new_id,
+                                                   ImVec2(pos.x, pos.y));
+                });
+
+                if (is_success(ret))
+                    log_w.log(5, "success\n");
+                else
+                    log_w.log(4, "fail\n");
+            }
+        }
+    }
+
+    if (show_save_file_dialog) {
+        if (sim.models.size()) {
+            const char* title = "Select file path to save";
+            const char8_t* filters[] = { u8".irt", nullptr };
+
+            ImGui::OpenPopup(title);
+            if (save_file_dialog(path, title, filters)) {
+                show_save_file_dialog = false;
+                log_w.log(
+                  5, "Save file to %s\n", (const char*)path.u8string().c_str());
+
+                log_w.log(3,
+                          "Write into file %s\n",
+                          (const char*)path.u8string().c_str());
+                if (auto os = std::ofstream(path); os.is_open()) {
+                    writer w(os);
+
+                    auto ret =
+                      w(sim, srcs, [](model_id mdl_id, float& x, float& y) {
+                          const auto index = irt::get_index(mdl_id);
+                          const auto pos = ImNodes::GetNodeEditorSpacePos(
+                            static_cast<int>(index));
+                          x = pos.x;
+                          y = pos.y;
+                      });
+
+                    if (is_success(ret))
+                        log_w.log(5, "success\n");
+                    else
+                        log_w.log(4, "error writing\n");
+                }
+            }
+        }
+    }
+
+    constexpr ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_None;
+    if (ImGui::BeginTabBar("editor bar", tab_bar_flags)) {
+        if (ImGui::BeginTabItem("model")) {
+            show_editor();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("sources")) {
+            show_sources();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     ImGui::End();
 
     return true;
-}
-
-editor*
-application::alloc_editor()
-{
-    if (srcs.binary_file_sources.capacity() == 0) {
-        srcs.init(50);
-    }
-
-    if (!editors.can_alloc(1u)) {
-        log_w.log(2, "Too many open editor\n");
-        return nullptr;
-    }
-
-    auto& ed = editors.alloc();
-    if (auto ret = ed.initialize(get_index(editors.get_id(ed))); is_bad(ret)) {
-        log_w.log(2, "Fail to initialize irritator: %s\n", status_string(ret));
-        editors.free(ed);
-        return nullptr;
-    }
-
-    log_w.log(5, "Open editor %s\n", ed.name.c_str());
-    return &ed;
-}
-
-void
-application::free_editor(editor& ed)
-{
-    log_w.log(5, "Close editor %s\n", ed.name.c_str());
-    editors.free(ed);
-}
-
-void
-application::settings_manager::show(bool* is_open)
-{
-    ImGui::SetNextWindowPos(ImVec2(300, 300), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(350, 400), ImGuiCond_Once);
-    if (!ImGui::Begin("Settings", is_open)) {
-        ImGui::End();
-        return;
-    }
-
-    ImGui::Text("Home.......: %s", home_dir.u8string().c_str());
-    ImGui::Text("Executable.: %s", executable_dir.u8string().c_str());
-    ImGui::Text("Libraries..:");
-    for (sz i = 0u, e = libraries_dir.size(); i != e; ++i)
-        ImGui::Text("- %s", libraries_dir[i].c_str());
-
-    ImGui::End();
-}
-
-editor*
-make_combo_editor_name(application& app, editor_id& current) noexcept
-{
-    editor* first = app.editors.try_to_get(current);
-    if (first == nullptr) {
-        if (!app.editors.next(first)) {
-            current = undefined<editor_id>();
-            return nullptr;
-        }
-    }
-
-    current = app.editors.get_id(first);
-
-    if (ImGui::BeginCombo("Name", first->name.c_str())) {
-        editor* ed = nullptr;
-        while (app.editors.next(ed)) {
-            const bool is_selected = current == app.editors.get_id(ed);
-
-            if (ImGui::Selectable(ed->name.c_str(), is_selected))
-                current = app.editors.get_id(ed);
-
-            if (is_selected)
-                ImGui::SetItemDefaultFocus();
-        }
-
-        ImGui::EndCombo();
-    }
-
-    return app.editors.try_to_get(current);
-}
-
-void
-application::show_plot_window()
-{
-    ImGui::SetNextWindowPos(ImVec2(50, 400), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(600, 350), ImGuiCond_Once);
-    if (!ImGui::Begin("Plot", &show_plot)) {
-        ImGui::End();
-        return;
-    }
-
-    static editor_id current = undefined<editor_id>();
-    if (auto* ed = make_combo_editor_name(*this, current); ed) {
-        if (ImPlot::BeginPlot("simulation", "t", "s")) {
-            ImPlot::PushStyleVar(ImPlotStyleVar_LineWeight, 1.f);
-
-            plot_output* out = nullptr;
-            while (ed->plot_outs.next(out)) {
-                if (!out->xs.empty() && !out->ys.empty())
-                    ImPlot::PlotLine(out->name.c_str(),
-                                     out->xs.data(),
-                                     out->ys.data(),
-                                     static_cast<int>(out->xs.size()));
-            }
-
-            ImPlot::PopStyleVar(1);
-            ImPlot::EndPlot();
-        }
-    }
-
-    ImGui::End();
 }
 
 } // namespace irt
